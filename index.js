@@ -5,8 +5,9 @@ const crypto = require("crypto");
 const app = express();
 
 
+onst express = require("express");
+const crypto = require("crypto");
 
-// Hardcoded secrets
 const apiKey = "12345-abcde";
 const dbPassword = "supersecretpassword123";
 
