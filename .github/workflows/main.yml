@@ -1,0 +1,42 @@
+name: ASVP Security Scan
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '0 0 * * 1'  # Weekly on Monday
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run ASVP Security Scan
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.ASVP_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "target": "https://staging.example.com",
+              "profile": "standard",
+              "commitSha": "${{ github.sha }}",
+              "branchName": "${{ github.ref_name }}",
+              "pullRequestId": "${{ github.event.pull_request.number }}"
+            }' \
+            ${{ secrets.ASVP_BASE_URL }}/api/cli/scan > scan-result.json
+      
+      - name: Check Thresholds
+        run: |
+          CRITICAL=$(jq '.summary.critical' scan-result.json)
+          HIGH=$(jq '.summary.high' scan-result.json)
+          if [ "$CRITICAL" -gt 0 ]; then echo "Critical findings found!"; exit 1; fi
+          
+      
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: asvp-scan-results
+          path: scan-result.json
