@@ -1,0 +1,20 @@
+name: ASVP Security Scan
+
+on:
+  push:
+    branches: [ main, staging ]
+  pull_request:
+    branches: [ main, staging ]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Run ASVP Scan
+        run: |
+          curl -X POST "https://dev2.averox.com/api/scan" \
+          -H "Authorization: Bearer ${{ secrets.ASVP_API_TOKEN }}" \
+          -d '{"config_name":"test"}'
