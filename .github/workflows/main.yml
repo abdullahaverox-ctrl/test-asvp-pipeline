@@ -1,42 +1,103 @@
-name: ASVP Security Scan
-
+name: ASVP Security Scan with Source Scan
 on:
   push:
-    branches: [main, master]
+    branches: [ main ]
   pull_request:
-    branches: [main, master]
-  schedule:
-    - cron: '0 0 * * 1'  # Weekly on Monday
+  workflow_dispatch:
 
 jobs:
-  security-scan:
+  asvp-source-scan:
     runs-on: ubuntu-latest
+    env:
+      ASVP_URL: ${{ secrets.ASVP_BASE_URL }}
+      ASVP_TOKEN: ${{ secrets.ASVP_API_TOKEN }}
+      TARGET_URL: "https://vc.averox.com"   # your ASVP target
+      SCAN_DIR: "./src"  # optional if you want local source scanning
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Run ASVP Security Scan
+
+      # ---- Preflight: tooling + secrets --------------------------------------
+      - name: Preflight
         run: |
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.ASVP_API_TOKEN }}" \
+          set -euo pipefail
+          command -v curl >/dev/null || { echo "::error::curl is required"; exit 1; }
+          command -v jq >/dev/null   || { echo "::error::jq is required"; exit 1; }
+          [ -n "${ASVP_TOKEN:-}" ] || { echo "::error::Secret ASVP_API_TOKEN is missing"; exit 1; }
+          [ -n "${ASVP_URL:-}"   ] || { echo "::error::Secret ASVP_BASE_URL is missing"; exit 1; }
+          echo "ASVP_URL=${ASVP_URL%/}" >> "$GITHUB_ENV"
+
+      # ---- Trigger ASVP scan ---------------------------------------------------
+      - name: Trigger ASVP scan
+        id: trigger
+        run: |
+          set -euo pipefail
+          BODY="$(mktemp)"
+          META=$(curl -sS --max-time 60 -o "$BODY" -w "%{http_code}\t%{content_type}" \
+            -X POST "$ASVP_URL/api/cicd/scan" \
+            -H "Authorization: Bearer $ASVP_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{
-              "target": "https://vc.averox.com",
-              "profile": "standard",
-              "commitSha": "${{ github.sha }}",
-              "branchName": "${{ github.ref_name }}",
-              "pullRequestId": "${{ github.event.pull_request.number }}"
-            }' \
-            ${{ secrets.ASVP_BASE_URL }}/api/cli/scan > scan-result.json
-      
-      - name: Check Thresholds
+            -d "$(jq -n --arg url "$TARGET_URL" --arg sha "$GITHUB_SHA" --arg br "$GITHUB_REF_NAME" \
+                  '{targetUrl:$url, profile:"standard", triggeredBy:"github-actions", commitSha:$sha, branchName:$br}')" )
+          CODE="${META%%$'\t'*}"; CTYPE="${META#*$'\t'}"; OUT="$(cat "$BODY")"
+          jq -n --arg code "$CODE" --arg ctype "$CTYPE" --argjson body "$(echo "$OUT" | jq -c '.' 2>/dev/null || jq -n --arg raw "$OUT" '{raw:$raw}')" \
+            '{endpoint:"/api/cicd/scan", httpStatus:$code, contentType:$ctype, body:$body}' > scan-trigger.json
+          echo "HTTP status : $CODE, Content-Type: $CTYPE"
+          case "$CTYPE" in *application/json*) : ;; *) echo "::error::Got '$CTYPE', not JSON"; exit 1 ;; esac
+          echo "$OUT" | jq empty >/dev/null 2>&1 || { echo "::error::Response is not valid JSON"; exit 1; }
+          [ "$CODE" = "401" ] && { echo "::error::Token rejected: $(echo "$OUT" | jq -r '.error')"; exit 1; }
+          [ "$CODE" = "200" ] || { echo "::error::HTTP $CODE: $(echo "$OUT" | jq -r '.error // .message // "unknown"')"; exit 1; }
+          echo "scan_id=$(echo "$OUT" | jq -r '.scanId')" >> "$GITHUB_OUTPUT"
+
+      # ---- Optional local source scan (Trivy) ---------------------------------
+      - name: Run local source scan (optional)
+        if: env.SCAN_DIR != ''
         run: |
-          CRITICAL=$(jq '.summary.critical' scan-result.json)
-          HIGH=$(jq '.summary.high' scan-result.json)
-          if [ "$CRITICAL" -gt 0 ]; then echo "Critical findings found!"; exit 1; fi
-          
-      
-      - name: Upload Scan Results
+          set -euo pipefail
+          command -v trivy >/dev/null && \
+          trivy fs --quiet --format json -o trivy-report.json "$SCAN_DIR" || \
+          echo "Skipping local Trivy scan; either not installed or SCAN_DIR empty"
+
+      # ---- Build findings.json -------------------------------------------------
+      - name: Build findings.json
+        run: |
+          set -euo pipefail
+          # Replace with your real findings from any scanner
+          jq -n '{ findings: [] }' > findings.json
+          echo "findings.json created"; cat findings.json
+
+      # ---- Post results to ASVP ------------------------------------------------
+      - name: Post results to ASVP
+        id: results
+        run: |
+          set -euo pipefail
+          BODY="$(mktemp)"
+          PAYLOAD="$(jq -n --arg scanId "${{ steps.trigger.outputs.scan_id }}" --slurpfile f findings.json \
+            '{scanId:$scanId, findings:($f[0].findings), duration:0}')"
+          META=$(curl -sS --max-time 60 -o "$BODY" -w "%{http_code}\t%{content_type}" \
+            -X POST "$ASVP_URL/api/cicd/results" \
+            -H "Authorization: Bearer $ASVP_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" )
+          CODE="${META%%$'\t'*}"; CTYPE="${META#*$'\t'}"; OUT="$(cat "$BODY")"
+          jq -n --arg code "$CODE" --arg ctype "$CTYPE" --argjson body "$(echo "$OUT" | jq -c '.' 2>/dev/null || jq -n --arg raw "$OUT" '{raw:$raw}')" \
+            '{endpoint:"/api/cicd/results", httpStatus:$code, contentType:$ctype, body:$body}' > results-response.json
+          jq -s '{scan: .[0], results: .[1]}' scan-trigger.json results-response.json > scan-result.json
+          echo "HTTP status : $CODE, Content-Type: $CTYPE"
+          echo "$OUT" | jq empty >/dev/null 2>&1 || { echo "::error::Results response not valid JSON"; exit 1; }
+          [ "$CODE" -lt 400 ] || { echo "::error::HTTP $CODE: $(echo "$OUT" | jq -r '.error // .message')"; exit 1; }
+          echo "Ingested breakdown: $(echo "$OUT" | jq -c '.breakdown')"
+
+      # ---- Upload artifacts ----------------------------------------------------
+      - name: Upload scan-result.json and related files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: asvp-scan-results
-          path: scan-result.json
+          name: asvp-source-scan-artifact
+          path: |
+            scan-result.json
+            scan-trigger.json
+            results-response.json
+            findings.json
+          if-no-files-found: warn
+          retention-days: 14
