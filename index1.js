@@ -5,10 +5,7 @@ onst express = require("express");
 const crypto = require("crypto");
 
 // SQL injection
-app.get("/user", (req, res) => {
-    const userInput = req.query.name;
-    db.query("SELECT * FROM users WHERE name = '" + userInput + "'");
-    res.send("User searched");
+app.g
 });
 
 // Command injection
