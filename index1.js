@@ -4,9 +4,6 @@
 onst express = require("express");
 const crypto = require("crypto");
 
-const apiKey = "12345-abcde";
-const dbPassword = "supersecretpassword123";
-
 // SQL injection
 app.get("/user", (req, res) => {
     const userInput = req.query.name;
